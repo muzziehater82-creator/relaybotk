@@ -19,7 +19,6 @@ AUTHORIZED_USER_IDS = {1513256892569485405, 1464639433276915825}
 
 WORDS_PATH = Path(__file__).with_name("words.json")
 MAX_WORD_LEN = 100
-MAX_WORDS = 500
 MESSAGE_LIMIT = 2000
 # Hard ceiling on how much attachment data is buffered for a single relay.
 MAX_RELAY_BYTES = 25 * 1024 * 1024
@@ -121,8 +120,6 @@ class WordStore:
                     rejected.append(w)
                 elif w in existing or w in added:
                     dupes.append(w)
-                elif len(self.words) + len(added) >= MAX_WORDS:
-                    rejected.append(w)
                 else:
                     added.append(w)
             if added:
@@ -486,7 +483,7 @@ async def addwords(ctx, *, raw: str = ""):
         lines.append("Already on the list: " + ", ".join(f"`{w}`" for w in dupes))
     if rejected:
         lines.append(
-            f"Rejected (over {MAX_WORD_LEN} chars, or the {MAX_WORDS}-word cap is full): "
+            f"Rejected (over {MAX_WORD_LEN} characters): "
             + ", ".join(f"`{w}`" for w in rejected)
         )
     await reply_chunked(ctx, "\n".join(lines))

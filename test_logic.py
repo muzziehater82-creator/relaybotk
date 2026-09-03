@@ -156,8 +156,18 @@ async def main():
         check("over-long rejected", (a, r), (["ok"], ["x" * 101]))
         s6 = B.WordStore(Path(d) / "w6.json")
         s6.load()
-        await s6.add([f"w{i}" for i in range(B.MAX_WORDS)])
-        check("cap enforced", (await s6.add(["overflow"]))[0::2], ([], ["overflow"]))
+        added6, _, rejected6 = await s6.add([f"w{i}" for i in range(2000)])
+        check("no word-count cap", (len(added6), rejected6), (2000, []))
+        check("no MAX_WORDS constant left", hasattr(B, "MAX_WORDS"), False)
+        check("huge list still matches", s6.find("hey w1999 there"), "w1999")
+        check("huge list rejects non-members", s6.find("hey w2000 there"), None)
+        check("huge list still whole-word", s6.find("xw1999y"), None)
+        import time as _t
+        t0 = _t.perf_counter()
+        for _ in range(200):
+            s6.find("an ordinary sentence with none of the watched words in it")
+        elapsed = _t.perf_counter() - t0
+        check(f"2000-word regex stays fast ({elapsed*1000:.0f}ms/200 scans)", elapsed < 1.0, True)
 
     print("-- channel locks --")
     l1 = B.channel_lock(1)
