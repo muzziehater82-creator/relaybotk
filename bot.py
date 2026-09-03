@@ -75,7 +75,9 @@ class WordStore:
     def load(self):
         if self.path.exists():
             try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+                # utf-8-sig: Windows editors and PowerShell write a BOM, and a
+                # BOM makes json.loads fail.
+                data = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 # Normalise on read so a hand-edited file still behaves.
                 seen = set()
                 words = []
