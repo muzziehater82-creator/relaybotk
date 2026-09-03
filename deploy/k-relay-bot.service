@@ -1,0 +1,33 @@
+[Unit]
+Description=k! Discord relay bot
+Documentation=https://github.com/muzziehater82-creator/relaybotk
+# Wait for real network connectivity, not just the interface coming up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+EnvironmentFile=__DIR__/.env
+ExecStart=__DIR__/.venv/bin/python -u bot.py
+
+# Always come back: crash, OOM, or reboot.
+Restart=always
+RestartSec=10
+# Don't give up permanently if it crash-loops during an outage.
+StartLimitIntervalSec=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=k-relay-bot
+
+# Modest hardening — the bot only needs outbound network and its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__DIR__
+
+[Install]
+WantedBy=multi-user.target
