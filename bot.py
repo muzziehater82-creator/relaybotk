@@ -26,6 +26,11 @@ MAX_WORD_LEN = 100
 MESSAGE_LIMIT = 2000
 # Hard ceiling on how much attachment data is buffered for a single relay.
 MAX_RELAY_BYTES = 25 * 1024 * 1024
+# The webhook the bot creates per channel to speak as the original author.
+WEBHOOK_NAME = "k-relay"
+# Discord rejects webhook usernames containing these, and caps them at 80 chars.
+BANNED_NAME_BITS = ("discord", "clyde")
+WEBHOOK_NAME_LIMIT = 80
 # Seconds between "not authorized" replies to the same user, so the denial
 # path cannot be used to make the bot spam on demand.
 DENIAL_COOLDOWN = 30.0
@@ -176,6 +181,8 @@ bot = commands.Bot(
 # Weak values: a lock is dropped once nothing holds or awaits it.
 _channel_locks = weakref.WeakValueDictionary()
 _denial_sent_at = {}
+# channel_id -> Webhook, so we don't refetch on every relay.
+_webhook_cache = {}
 
 
 def channel_lock(channel_id):
@@ -221,20 +228,57 @@ def split_message(text, limit=MESSAGE_LIMIT):
     return chunks or [""]
 
 
-def build_chunks(header, cont_header, body):
-    """Chunks for one relay, with the header always attached to the content."""
+def build_chunks(prefix, body, cont_prefix=""):
+    """Chunks for one relay; `prefix` always rides on the first chunk of content."""
     if not body:
-        return split_message(header)
-    # Size against the longer of the two prefixes — the continuation header is
-    # usually the longer one, and a chunk built on it must still fit.
-    room = MESSAGE_LIMIT - max(len(header), len(cont_header)) - 1
-    if room < 200:  # absurdly long header; degrade rather than misbehave
-        return split_message(header) + split_message(body)
+        return [prefix] if prefix else []
+    if not prefix and not cont_prefix:
+        return split_message(body)
+    # Size against the longer prefix so a continuation chunk still fits.
+    room = MESSAGE_LIMIT - max(len(prefix), len(cont_prefix)) - 1
+    if room < 200:  # absurdly long prefix; degrade rather than misbehave
+        return (split_message(prefix) if prefix else []) + split_message(body)
     parts = split_message(body, room)
-    out = [f"{header}\n{parts[0]}"]
+    out = [f"{prefix}\n{parts[0]}" if prefix else parts[0]]
     for part in parts[1:]:
-        out.append(f"{cont_header}\n{part}")
+        out.append(f"{cont_prefix}\n{part}" if cont_prefix else part)
     return out
+
+
+def sanitize_webhook_username(name):
+    """Discord rejects webhook usernames containing 'discord' or 'clyde'."""
+    cleaned = " ".join(str(name).split())
+    for bad in BANNED_NAME_BITS:
+        # Break the banned substring with a zero-width space; still reads right.
+        cleaned = re.sub(
+            re.escape(bad),
+            lambda m: m.group(0)[0] + "​" + m.group(0)[1:],
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    cleaned = cleaned[:WEBHOOK_NAME_LIMIT].strip()
+    return cleaned or "Unknown"
+
+
+async def get_webhook(channel):
+    """A webhook the bot owns on this channel (or its parent), or None."""
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    if parent is None or not hasattr(parent, "webhooks"):
+        return None
+    hook = _webhook_cache.get(parent.id)
+    if hook is not None:
+        return hook
+    try:
+        for existing in await parent.webhooks():
+            if existing.token and existing.user and existing.user.id == bot.user.id:
+                _webhook_cache[parent.id] = existing
+                return existing
+        hook = await parent.create_webhook(name=WEBHOOK_NAME, reason="k! relay bot")
+    except (discord.Forbidden, discord.HTTPException):
+        log.warning("cannot get or create a webhook in #%s — falling back", parent)
+        return None
+    _webhook_cache[parent.id] = hook
+    return hook
 
 
 def forwarded_text(message):
@@ -286,26 +330,43 @@ async def collect_attachments(message):
 
 
 async def resolve_reply_target(message):
-    """(state, author_id) describing the message this one replied to."""
+    """(state, author_id, jump_url) describing the message this one replied to."""
     ref = message.reference
     if ref is None or ref.message_id is None or is_forward(message):
-        return REPLY_NONE, None
+        return REPLY_NONE, None, None
+    # jump_url is built from the reference itself, so it works even when the
+    # target cannot be fetched.
+    jump = ref.jump_url
     resolved = ref.resolved
     if isinstance(resolved, discord.Message):
-        return REPLY_KNOWN, resolved.author.id
+        return REPLY_KNOWN, resolved.author.id, resolved.jump_url
     if isinstance(resolved, discord.DeletedReferencedMessage):
-        return REPLY_DELETED, None
+        return REPLY_DELETED, None, jump
     try:
         target = await message.channel.fetch_message(ref.message_id)
     except discord.NotFound:
-        return REPLY_DELETED, None
+        return REPLY_DELETED, None, jump
     except (discord.Forbidden, discord.HTTPException):
         # We simply cannot see it; do not claim it was deleted.
-        return REPLY_UNKNOWN, None
-    return REPLY_KNOWN, target.author.id
+        return REPLY_UNKNOWN, None, jump
+    return REPLY_KNOWN, target.author.id, target.jump_url
+
+
+def build_reply_line(state, reply_author_id, jump_url, forwarded):
+    """The context line placed above relayed content, or '' when there is none."""
+    if forwarded:
+        return "↪ forwarded a message"
+    if state == REPLY_NONE or not jump_url:
+        return ""
+    if state == REPLY_KNOWN and reply_author_id is not None:
+        return f"↪ replying to <@{reply_author_id}> — {jump_url}"
+    if state == REPLY_DELETED:
+        return "↪ replying to a message that no longer exists"
+    return f"↪ replying to an earlier message — {jump_url}"
 
 
 def build_header(author_id, state, reply_author_id, forwarded):
+    """Attribution line for the fallback path, where no webhook is available."""
     who = f"\U0001f4e8 <@{author_id}>"
     if forwarded:
         return f"{who} forwarded a message:"
@@ -344,6 +405,83 @@ def relay_blocked_reason(message):
     return None
 
 
+async def send_via_webhook(message, body, files, reply_line):
+    """Post as the original author. True if posted, None to fall back."""
+    hook = await get_webhook(message.channel)
+    if hook is None:
+        return None
+    parent = message.channel.parent if isinstance(message.channel, discord.Thread) else message.channel
+    extra = {"thread": message.channel} if isinstance(message.channel, discord.Thread) else {}
+
+    chunks = build_chunks(reply_line, body)
+    if not chunks:
+        if not files:
+            return False
+        chunks = [""]
+
+    for i, chunk in enumerate(chunks):
+        try:
+            await hook.send(
+                content=chunk if chunk else discord.utils.MISSING,
+                username=sanitize_webhook_username(message.author.display_name),
+                avatar_url=message.author.display_avatar.url,
+                files=files if i == 0 else [],
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+                **extra,
+            )
+        except discord.NotFound:
+            # Someone deleted the webhook out from under us.
+            _webhook_cache.pop(parent.id, None)
+            if i == 0:
+                return None
+            log.warning("webhook vanished partway through a relay in #%s", message.channel)
+            return True
+        except discord.HTTPException:
+            if i == 0:
+                log.exception("webhook relay failed in #%s — falling back", message.channel)
+                return None
+            log.exception("webhook relay failed partway (chunk %d) in #%s", i, message.channel)
+            return True  # something is already posted; do not duplicate it
+    return True
+
+
+async def send_as_bot(message, body, files, state, reply_author_id, forwarded):
+    """Fallback when no webhook is available: post as the bot, with attribution."""
+    header = build_header(message.author.id, state, reply_author_id, forwarded)
+    cont_header = f"… <@{message.author.id}> (cont.):"
+
+    reference = None
+    if state == REPLY_KNOWN and message.reference is not None:
+        reference = discord.MessageReference(
+            message_id=message.reference.message_id,
+            channel_id=message.channel.id,
+            guild_id=message.guild.id,
+            fail_if_not_exists=False,
+        )
+    # Only the author is pingable; anything inside the relayed content is inert.
+    mentions = discord.AllowedMentions(
+        everyone=False, roles=False, users=[message.author], replied_user=False
+    )
+
+    chunks = build_chunks(header, body, cont_header)
+    for i, chunk in enumerate(chunks):
+        try:
+            await message.channel.send(
+                chunk,
+                files=files if i == 0 else [],
+                reference=reference if i == 0 else None,
+                allowed_mentions=mentions,
+            )
+        except discord.HTTPException:
+            log.exception(
+                "failed to send relay chunk %d in #%s — leaving the original in place",
+                i, message.channel,
+            )
+            return i > 0  # partial post still counts; never duplicate
+    return True
+
+
 async def relay(message, matched):
     blocked = relay_blocked_reason(message)
     if blocked:
@@ -352,14 +490,11 @@ async def relay(message, matched):
 
     async with channel_lock(message.channel.id):
         forwarded = is_forward(message)
-        state, reply_author_id = await resolve_reply_target(message)
+        state, reply_author_id, jump_url = await resolve_reply_target(message)
 
         files = await collect_attachments(message)
         if files is None:
             return  # could not preserve attachments; leave the original alone
-
-        header = build_header(message.author.id, state, reply_author_id, forwarded)
-        cont_header = f"… <@{message.author.id}> (cont.):"
 
         body = message.content or ""
         fwd = forwarded_text(message)
@@ -369,37 +504,17 @@ async def relay(message, matched):
         if message.stickers:
             body += "\n*(stickers: " + ", ".join(s.name for s in message.stickers) + ")*"
 
-        reference = None
-        if state == REPLY_KNOWN:
-            reference = discord.MessageReference(
-                message_id=message.reference.message_id,
-                channel_id=message.channel.id,
-                guild_id=message.guild.id,
-                fail_if_not_exists=False,
-            )
-
-        # Only the author is pingable; anything inside the relayed content is inert.
-        mentions = discord.AllowedMentions(
-            everyone=False, roles=False, users=[message.author], replied_user=False
-        )
+        reply_line = build_reply_line(state, reply_author_id, jump_url, forwarded)
 
         # Post the relay BEFORE deleting the original — if a send fails, the
         # user's message must still be there.
-        chunks = build_chunks(header, cont_header, body)
-        for i, chunk in enumerate(chunks):
-            try:
-                await message.channel.send(
-                    chunk,
-                    files=files if i == 0 else [],
-                    reference=reference if i == 0 else None,
-                    allowed_mentions=mentions,
-                )
-            except discord.HTTPException:
-                log.exception(
-                    "failed to send relay chunk %d in #%s — leaving the original in place",
-                    i, message.channel,
-                )
-                return
+        posted = await send_via_webhook(message, body, files, reply_line)
+        if posted is None:
+            posted = await send_as_bot(
+                message, body, files, state, reply_author_id, forwarded
+            )
+        if not posted:
+            return  # nothing was posted; leave the original alone
 
         try:
             await message.delete()

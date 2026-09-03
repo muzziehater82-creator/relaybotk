@@ -35,33 +35,66 @@ check("newline split lossless",
       "\n".join(B.split_message(long_lines)).replace("\n", ""), long_lines.replace("\n", ""))
 check("empty text", B.split_message(""), [""])
 
-print("-- build_chunks (header must ride with the content) --")
-h, ch = "HDR", "CONT"
-one = B.build_chunks(h, ch, "hello")
-check("single chunk", one, ["HDR\nhello"])
-big = B.build_chunks(h, ch, "z" * 5000)
-check("header on first chunk", big[0].startswith("HDR\nz"), True)
-check("header not alone", len(big[0]) > len(h) + 1, True)
-check("continuations carry attribution", all(c.startswith("CONT\n") for c in big[1:]), True)
+print("-- build_chunks (prefix must ride with the content) --")
+check("no prefix passes through", B.build_chunks("", "hello"), ["hello"])
+check("prefix joins content", B.build_chunks("PFX", "hello"), ["PFX\nhello"])
+check("empty body with prefix", B.build_chunks("PFX", ""), ["PFX"])
+check("empty body, no prefix", B.build_chunks("", ""), [])
+big = B.build_chunks("PFX", "z" * 5000)
+check("prefix on first chunk", big[0].startswith("PFX\nz"), True)
+check("prefix not stranded alone", len(big[0]) > 4, True)
+check("webhook continuations are bare", all(not c.startswith("PFX") for c in big[1:]), True)
 check("every chunk within limit", all(len(c) <= 2000 for c in big), True)
-check("no content lost",
-      "".join(big).replace("HDR\n", "").replace("CONT\n", ""), "z" * 5000)
-maxmsg = B.build_chunks(h, ch, "w" * 2000)  # a full-length original + header
-check("2000-char original does not 400", all(len(c) <= 2000 for c in maxmsg), True)
-check("empty body still posts header", B.build_chunks(h, ch, ""), ["HDR"])
-# Real headers: the continuation prefix is LONGER than the main one.
+check("no content lost", "".join(big).replace("PFX\n", ""), "z" * 5000)
+check("2000-char body does not 400",
+      all(len(c) <= 2000 for c in B.build_chunks("PFX", "w" * 2000)), True)
+
 uid = 1513256892569485405
+rc = "… <@%d> (cont.):" % uid
 rh = B.build_header(uid, B.REPLY_KNOWN, uid, False)
-rc = f"… <@{uid}> (cont.):"
 rh_plain = B.build_header(uid, B.REPLY_NONE, None, False)
-# Both orderings occur in practice, which is why build_chunks sizes on max().
 check("cont longer than a plain header", len(rc) > len(rh_plain), True)
 check("cont shorter than a reply header", len(rc) < len(rh), True)
 for name, head in (("reply header", rh), ("plain header", rh_plain)):
-    real = B.build_chunks(head, rc, "q" * 6000)
-    check(f"{name}: all chunks fit", all(len(c) <= 2000 for c in real), True)
-    check(f"{name}: nothing lost",
+    real = B.build_chunks(head, "q" * 6000, rc)
+    check("fallback %s: all chunks fit" % name, all(len(c) <= 2000 for c in real), True)
+    check("fallback %s: nothing lost" % name,
           "".join(real).replace(head + "\n", "").replace(rc + "\n", ""), "q" * 6000)
+_jl = "https://discord.com/channels/%d/%d/%d" % (uid, uid, uid)
+wh = B.build_chunks(B.build_reply_line(B.REPLY_KNOWN, uid, _jl, False), "e" * 6000)
+check("real jump-link prefix: chunks fit", all(len(c) <= 2000 for c in wh), True)
+
+print("-- build_reply_line (webhook mode) --")
+JUMP = "https://discord.com/channels/1/2/3"
+check("no reply -> no line", B.build_reply_line(B.REPLY_NONE, None, None, False), "")
+check("known reply has mention and link",
+      B.build_reply_line(B.REPLY_KNOWN, 42, JUMP, False),
+      "↪ replying to <@42> — " + JUMP)
+check("deleted target claims no link",
+      B.build_reply_line(B.REPLY_DELETED, None, JUMP, False),
+      "↪ replying to a message that no longer exists")
+check("unknown target still links",
+      B.build_reply_line(B.REPLY_UNKNOWN, None, JUMP, False),
+      "↪ replying to an earlier message — " + JUMP)
+check("forward", B.build_reply_line(B.REPLY_NONE, None, None, True),
+      "↪ forwarded a message")
+check("raw url, not a masked link",
+      "](" in B.build_reply_line(B.REPLY_KNOWN, 42, JUMP, False), False)
+
+print("-- sanitize_webhook_username --")
+S = B.sanitize_webhook_username
+ZW = "​"
+check("plain name", S("Alice"), "Alice")
+check("whitespace collapsed", S("  Bob   Smith "), "Bob Smith")
+check("empty falls back", S(""), "Unknown")
+check("whitespace-only falls back", S("      "), "Unknown")
+check("length capped at 80", len(S("x" * 200)), 80)
+for banned in ("discord", "Discord", "DISCORD", "clyde", "Clyde"):
+    out = S("cool " + banned + " guy")
+    check("%r not literally present" % banned, banned.lower() in out.lower(), False)
+    check("%r still readable once ZWSP stripped" % banned,
+          banned.lower() in out.replace(ZW, "").lower(), True)
+check("case preserved through sanitising", S("Discord").replace(ZW, ""), "Discord")
 
 print("-- build_header --")
 check("plain", B.build_header(1, B.REPLY_NONE, None, False), "\U0001f4e8 <@1> said:")
