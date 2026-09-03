@@ -1,0 +1,10 @@
+.env
+*.env
+*.env.*
+*env.example
+words.json
+words.json.tmp
+words.json.corrupt
+__pycache__/
+*.py[cod]
+*.zip

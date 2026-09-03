@@ -1,0 +1,188 @@
+import asyncio, json, sys, tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).parent))
+import discord
+import bot as B
+
+fails = []
+
+
+def check(label, got, want):
+    if got != want:
+        fails.append(f"{label}\n     got:  {got!r}\n     want: {want!r}")
+        print(f"  FAIL {label}")
+    else:
+        print(f"  ok   {label}")
+
+
+print("-- parse_word_list --")
+check("parens form", B.parse_word_list("(a, b, c)"), ["a", "b", "c"])
+check("no parens", B.parse_word_list("a, b, c"), ["a", "b", "c"])
+check("phrases + case", B.parse_word_list("(Good Morning, FOO)"), ["good morning", "foo"])
+check("messy spacing", B.parse_word_list("(  a  b ,   c  )"), ["a b", "c"])
+check("empties dropped", B.parse_word_list("(a,,  , b)"), ["a", "b"])
+check("dupes collapsed", B.parse_word_list("(a, A, a)"), ["a"])
+check("empty input", B.parse_word_list(""), [])
+check("only parens", B.parse_word_list("()"), [])
+
+print("-- split_message --")
+check("short passthrough", B.split_message("hello"), ["hello"])
+check("all chunks within limit", all(len(c) <= 2000 for c in B.split_message("y" * 5000)), True)
+long_lines = "\n".join("line " + str(i) * 50 for i in range(100))
+check("newline split lossless",
+      "\n".join(B.split_message(long_lines)).replace("\n", ""), long_lines.replace("\n", ""))
+check("empty text", B.split_message(""), [""])
+
+print("-- build_chunks (header must ride with the content) --")
+h, ch = "HDR", "CONT"
+one = B.build_chunks(h, ch, "hello")
+check("single chunk", one, ["HDR\nhello"])
+big = B.build_chunks(h, ch, "z" * 5000)
+check("header on first chunk", big[0].startswith("HDR\nz"), True)
+check("header not alone", len(big[0]) > len(h) + 1, True)
+check("continuations carry attribution", all(c.startswith("CONT\n") for c in big[1:]), True)
+check("every chunk within limit", all(len(c) <= 2000 for c in big), True)
+check("no content lost",
+      "".join(big).replace("HDR\n", "").replace("CONT\n", ""), "z" * 5000)
+maxmsg = B.build_chunks(h, ch, "w" * 2000)  # a full-length original + header
+check("2000-char original does not 400", all(len(c) <= 2000 for c in maxmsg), True)
+check("empty body still posts header", B.build_chunks(h, ch, ""), ["HDR"])
+# Real headers: the continuation prefix is LONGER than the main one.
+uid = 1513256892569485405
+rh = B.build_header(uid, B.REPLY_KNOWN, uid, False)
+rc = f"… <@{uid}> (cont.):"
+rh_plain = B.build_header(uid, B.REPLY_NONE, None, False)
+# Both orderings occur in practice, which is why build_chunks sizes on max().
+check("cont longer than a plain header", len(rc) > len(rh_plain), True)
+check("cont shorter than a reply header", len(rc) < len(rh), True)
+for name, head in (("reply header", rh), ("plain header", rh_plain)):
+    real = B.build_chunks(head, rc, "q" * 6000)
+    check(f"{name}: all chunks fit", all(len(c) <= 2000 for c in real), True)
+    check(f"{name}: nothing lost",
+          "".join(real).replace(head + "\n", "").replace(rc + "\n", ""), "q" * 6000)
+
+print("-- build_header --")
+check("plain", B.build_header(1, B.REPLY_NONE, None, False), "\U0001f4e8 <@1> said:")
+check("reply known", B.build_header(1, B.REPLY_KNOWN, 2, False),
+      "\U0001f4e8 <@1> said, replying to <@2>:")
+check("reply deleted", B.build_header(1, B.REPLY_DELETED, None, False),
+      "\U0001f4e8 <@1> said, replying to a message that no longer exists:")
+check("reply unknown is not claimed deleted", B.build_header(1, B.REPLY_UNKNOWN, None, False),
+      "\U0001f4e8 <@1> said, replying to an earlier message:")
+check("forward", B.build_header(1, B.REPLY_NONE, None, True),
+      "\U0001f4e8 <@1> forwarded a message:")
+
+print("-- forwarded / scannable text --")
+msg = SimpleNamespace(content="look at this",
+                      message_snapshots=[SimpleNamespace(content="secret foo inside")])
+check("forwarded text extracted", B.forwarded_text(msg), "secret foo inside")
+check("scannable includes snapshot", B.scannable_text(msg), "look at this\nsecret foo inside")
+check("no snapshots", B.scannable_text(SimpleNamespace(content="hi", message_snapshots=[])), "hi")
+check("snapshots attr missing", B.scannable_text(SimpleNamespace(content="hi")), "hi")
+
+print("-- allowed_mentions: the mention_author=False trap --")
+from discord.http import handle_message_parameters
+prev = bot_default = B.bot._connection.allowed_mentions
+check("bot has a non-default allowed_mentions", prev is not None, True)
+p = handle_message_parameters(
+    content="Added: `@everyone`", mention_author=False, previous_allowed_mentions=prev
+)
+check("reply payload is inert", p.payload["allowed_mentions"],
+      {"parse": [], "replied_user": False})
+user = SimpleNamespace(id=42)
+am = discord.AllowedMentions(everyone=False, roles=False, users=[user], replied_user=False)
+p2 = handle_message_parameters(content="hi <@42> @everyone", allowed_mentions=am,
+                               previous_allowed_mentions=prev)
+check("relay whitelists only the author", p2.payload["allowed_mentions"],
+      {"parse": [], "users": [42]})
+check("relay does not parse @everyone/roles", p2.payload["allowed_mentions"]["parse"], [])
+
+
+async def main():
+    print("-- WordStore matching --")
+    with tempfile.TemporaryDirectory() as d:
+        s = B.WordStore(Path(d) / "words.json")
+        s.load()
+        check("no words -> no match", s.find("anything at all"), None)
+        await s.add(["foo", "good morning", "c++", "a.b"])
+        check("exact", s.find("foo"), "foo")
+        check("case insensitive", s.find("FOO"), "foo")
+        check("NOT substring 'food'", s.find("i like food"), None)
+        check("NOT substring 'buffoon'", s.find("what a buffoon"), None)
+        check("phrase match", s.find("say good morning to her"), "good morning")
+        check("phrase collapses spacing", s.find("good    morning"), "good morning")
+        check("regex chars literal", s.find("i know c++ well"), "c++")
+        check("dot not a wildcard", s.find("axb"), None)
+        check("newline boundary", s.find("hey\nfoo\nbye"), "foo")
+        a2, d2, _ = await s.add(["FOO"])
+        check("dupe after normalise", (a2, d2), ([], ["foo"]))
+        check("remove normalises", await s.remove(["  C++  "]), (["c++"], []))
+
+        s2 = B.WordStore(Path(d) / "words.json")
+        s2.load()
+        check("reload from disk", sorted(s2.words), ["a.b", "foo", "good morning"])
+        check("not degraded", s2.degraded, False)
+
+        print("-- persist-before-mutate --")
+        s3 = B.WordStore(Path(d) / "sub" / "words.json")  # parent dir does not exist
+        s3.load()
+        try:
+            await s3.add(["boom"])
+            check("write failure raises", False, True)
+        except B.StoreWriteError:
+            check("write failure raises", True, True)
+        check("memory untouched after failed write", s3.words, [])
+        check("no match after failed write", s3.find("boom"), None)
+
+        print("-- corrupt file handling --")
+        bad = Path(d) / "bad.json"
+        bad.write_text("{not json at all", encoding="utf-8")
+        s4 = B.WordStore(bad)
+        s4.load()
+        check("degraded flag set", s4.degraded, True)
+        check("starts empty", s4.words, [])
+        check("bad file preserved", bad.with_suffix(".json.corrupt").exists(), True)
+        check("original moved away", bad.exists(), False)
+        await s4.add(["fresh"])
+        check("can still write after corruption", s4.words, ["fresh"])
+        check("corrupt backup still there", bad.with_suffix(".json.corrupt").exists(), True)
+
+        print("-- caps --")
+        s5 = B.WordStore(Path(d) / "w5.json")
+        s5.load()
+        a, _, r = await s5.add(["x" * 101, "ok"])
+        check("over-long rejected", (a, r), (["ok"], ["x" * 101]))
+        s6 = B.WordStore(Path(d) / "w6.json")
+        s6.load()
+        await s6.add([f"w{i}" for i in range(B.MAX_WORDS)])
+        check("cap enforced", (await s6.add(["overflow"]))[0::2], ([], ["overflow"]))
+
+    print("-- channel locks --")
+    l1 = B.channel_lock(1)
+    check("same lock for same channel", B.channel_lock(1) is l1, True)
+    check("different lock per channel", B.channel_lock(2) is not l1, True)
+    del l1
+    check("weak map drops unheld locks", len(B._channel_locks) <= 2, True)
+
+    print("-- registration --")
+    check("commands", sorted(c.name for c in B.bot.commands),
+          ["addwords", "clearwords", "help", "listwords", "removewords"])
+    check("no slash commands", len(B.bot.tree.get_commands()), 0)
+    check("message_content intent", B.bot.intents.message_content, True)
+    check("prefix", B.bot.command_prefix, "k!")
+    check("edit handler is raw only", hasattr(B, "on_message_edit"), False)
+    check("raw edit handler present", callable(getattr(B, "on_raw_message_edit", None)), True)
+    check("authorized ids", B.AUTHORIZED_USER_IDS,
+          {1513256892569485405, 1464639433276915825})
+
+
+asyncio.run(main())
+print()
+if fails:
+    print(f"{len(fails)} FAILURE(S):")
+    for f in fails:
+        print("  - " + f)
+    sys.exit(1)
+print("ALL TESTS PASSED")
