@@ -8,3 +8,6 @@ words.json.corrupt
 __pycache__/
 *.py[cod]
 *.zip
+*.rar
+*.7z
+*.tar.gz
