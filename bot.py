@@ -15,7 +15,11 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 PREFIX = "k!"
-AUTHORIZED_USER_IDS = {1513256892569485405, 1464639433276915825}
+AUTHORIZED_USER_IDS = {
+    1513256892569485405,
+    1464639433276915825,
+    1414684138996236344,
+}
 
 WORDS_PATH = Path(__file__).with_name("words.json")
 MAX_WORD_LEN = 100

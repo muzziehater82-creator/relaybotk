@@ -185,7 +185,7 @@ async def main():
     check("edit handler is raw only", hasattr(B, "on_message_edit"), False)
     check("raw edit handler present", callable(getattr(B, "on_raw_message_edit", None)), True)
     check("authorized ids", B.AUTHORIZED_USER_IDS,
-          {1513256892569485405, 1464639433276915825})
+          {1513256892569485405, 1464639433276915825, 1414684138996236344})
 
 
 asyncio.run(main())
